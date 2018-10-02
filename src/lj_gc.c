@@ -39,11 +39,13 @@
 /* -- Mark phase ---------------------------------------------------------- */
 
 /* Mark a TValue (if needed). */
+// 如果该tvalue是一个gc对象且为白色的情况下，标记该节点，并把节点放入到灰色链表中
 #define gc_marktv(g, tv) \
   { lua_assert(!tvisgcv(tv) || (~itype(tv) == gcval(tv)->gch.gct)); \
     if (tviswhite(tv)) gc_mark(g, gcV(tv)); }
 
 /* Mark a GCobj (if needed). */
+// 如果当前节点为白色，则把节点标记为灰色并放入到灰色链表中
 #define gc_markobj(g, o) \
   { if (iswhite(obj2gco(o))) gc_mark(g, obj2gco(o)); }
 
@@ -51,24 +53,29 @@
 #define gc_mark_str(s)		((s)->marked &= (uint8_t)~LJ_GC_WHITES)
 
 /* Mark a white GCobj. */
+// 标记gc对象为灰色节点并加入到灰色链表中
 static void gc_mark(global_State *g, GCobj *o)
 {
   int gct = o->gch.gct;
   lua_assert(iswhite(o) && !isdead(g, o));
-  white2gray(o);
+  white2gray(o);    // 清空白色状态（白色和黑色标记位都为空的话即为灰色）
   if (LJ_UNLIKELY(gct == ~LJ_TUDATA)) {
+    // userdata
     GCtab *mt = tabref(gco2ud(o)->metatable);
+    // userdata不会有子节点，所以不会有灰色状态，如果引用到的话直接标记为黑色
     gray2black(o);  /* Userdata are never gray. */
-    if (mt) gc_markobj(g, mt);
-    gc_markobj(g, tabref(gco2ud(o)->env));
+    if (mt) gc_markobj(g, mt);  // 如果userdata设置了metatable，则标记metatable
+    gc_markobj(g, tabref(gco2ud(o)->env));  // 标记userdata的环境变量
   } else if (LJ_UNLIKELY(gct == ~LJ_TUPVAL)) {
+    // upvalue
     GCupval *uv = gco2uv(o);
-    gc_marktv(g, uvval(uv));
-    if (uv->closed)
+    gc_marktv(g, uvval(uv));  // 如果upvalue对应的是gc对象的话标记该gc对象
+    if (uv->closed)        // TODO: upvalue什么时候被closed？为什么closed的upvalue不会变灰？，如果不是closed的upvalue标记成灰色了，为什么不加入到gray list中？
       gray2black(o);  /* Closed upvalues are never gray. */
   } else if (gct != ~LJ_TSTR && gct != ~LJ_TCDATA) {
     lua_assert(gct == ~LJ_TFUNC || gct == ~LJ_TTAB ||
 	       gct == ~LJ_TTHREAD || gct == ~LJ_TPROTO);
+    // 如果类型不是string和cdata，加入到gray链表中
     setgcrefr(o->gch.gclist, g->gc.gray);
     setgcref(g->gc.gray, o);
   }
@@ -86,14 +93,17 @@ static void gc_mark_gcroot(global_State *g)
 /* Start a GC cycle and mark the root set. */
 static void gc_mark_start(global_State *g)
 {
+  // gray，grayagain，weak链表初始化为空
   setgcrefnull(g->gc.gray);
   setgcrefnull(g->gc.grayagain);
   setgcrefnull(g->gc.weak);
+
+  // 标记主线程，主线程环境变量，全局注册变量，以及root变量为灰色，并加入到灰色链表中
   gc_markobj(g, mainthread(g));
   gc_markobj(g, tabref(mainthread(g)->env));
   gc_marktv(g, &g->registrytv);
-  gc_mark_gcroot(g);
-  g->gc.state = GCSpropagate;
+  gc_mark_gcroot(g);      // TODO：不太了解gcroot用在什么时候
+  g->gc.state = GCSpropagate; // 设置状态为标记状态
 }
 
 /* Mark open upvalues. */
@@ -154,13 +164,17 @@ size_t lj_gc_separateudata(global_State *g, int all)
 /* -- Propagation phase --------------------------------------------------- */
 
 /* Traverse a table. */
+// 遍历table中的元素
 static int gc_traverse_tab(global_State *g, GCtab *t)
 {
   int weak = 0;
   cTValue *mode;
+  // 如果table有metatable的话标记metatable
   GCtab *mt = tabref(t->metatable);
   if (mt)
     gc_markobj(g, mt);
+  
+  // 查看table的弱引用设置
   mode = lj_meta_fastg(g, mt, MM_mode);
   if (mode && tvisstr(mode)) {  /* Valid __mode field? */
     const char *modestr = strVdata(mode);
@@ -169,6 +183,7 @@ static int gc_traverse_tab(global_State *g, GCtab *t)
       if (c == 'k') weak |= LJ_GC_WEAKKEY;
       else if (c == 'v') weak |= LJ_GC_WEAKVAL;
     }
+    // 如果table有弱引用设置，设置了弱引用的table在atomic阶段进行删除
     if (weak) {  /* Weak tables are cleared in the atomic phase. */
 #if LJ_HASFFI
       CTState *cts = ctype_ctsG(g);
@@ -177,19 +192,23 @@ static int gc_traverse_tab(global_State *g, GCtab *t)
       } else
 #endif
       {
+  // 标记为弱引用，并把该节点加入到全局的弱引用链表中
 	t->marked = (uint8_t)((t->marked & ~LJ_GC_WEAK) | weak);
 	setgcrefr(t->gclist, g->gc.weak);
 	setgcref(g->gc.weak, obj2gco(t));
       }
     }
   }
+  // 如果值和value都是弱引用，直接返回
   if (weak == LJ_GC_WEAK)  /* Nothing to mark if both keys/values are weak. */
     return 1;
+  // 如果值没有设置弱引用，标记所有数值部分的tvalue
   if (!(weak & LJ_GC_WEAKVAL)) {  /* Mark array part. */
     MSize i, asize = t->asize;
     for (i = 0; i < asize; i++)
       gc_marktv(g, arrayslot(t, i));
   }
+  // 标记所有的hash table部分
   if (t->hmask > 0) {  /* Mark hash part. */
     Node *node = noderef(t->node);
     MSize i, hmask = t->hmask;
@@ -197,6 +216,7 @@ static int gc_traverse_tab(global_State *g, GCtab *t)
       Node *n = &node[i];
       if (!tvisnil(&n->val)) {  /* Mark non-empty slot. */
 	lua_assert(!tvisnil(&n->key));
+  // 标记进行弱引用判断
 	if (!(weak & LJ_GC_WEAKKEY)) gc_marktv(g, &n->key);
 	if (!(weak & LJ_GC_WEAKVAL)) gc_marktv(g, &n->val);
       }
@@ -208,15 +228,23 @@ static int gc_traverse_tab(global_State *g, GCtab *t)
 /* Traverse a function. */
 static void gc_traverse_func(global_State *g, GCfunc *fn)
 {
+  // 标记函数的环境变量
   gc_markobj(g, tabref(fn->c.env));
   if (isluafunc(fn)) {
+    // 如果是lua的函数
     uint32_t i;
     lua_assert(fn->l.nupvalues <= funcproto(fn)->sizeuv);
+
+    // 标记该函数的proto对象
     gc_markobj(g, funcproto(fn));
+
+    // 标记函数所有upvalue对象
     for (i = 0; i < fn->l.nupvalues; i++)  /* Mark Lua function upvalues. */
       gc_markobj(g, &gcref(fn->l.uvptr[i])->uv);
   } else {
+    // 如果是c函数
     uint32_t i;
+    // 标记所有的upvalue对象
     for (i = 0; i < fn->c.nupvalues; i++)  /* Mark C function upvalues. */
       gc_marktv(g, &fn->c.upvalue[i]);
   }
@@ -261,7 +289,10 @@ static void gc_traverse_trace(global_State *g, GCtrace *T)
 static void gc_traverse_proto(global_State *g, GCproto *pt)
 {
   ptrdiff_t i;
+  // 标记该chunk的名字
   gc_mark_str(proto_chunkname(pt));
+
+  // 标记所有proto用到的常量。TODO：不太理解
   for (i = -(ptrdiff_t)pt->sizekgc; i < 0; i++)  /* Mark collectable consts. */
     gc_markobj(g, proto_kgc(pt, i));
 #if LJ_HASJIT
@@ -290,14 +321,19 @@ static MSize gc_traverse_frames(global_State *g, lua_State *th)
 static void gc_traverse_thread(global_State *g, lua_State *th)
 {
   TValue *o, *top = th->top;
+  // 标记thread的所有栈中的元素
   for (o = tvref(th->stack)+1; o < top; o++)
     gc_marktv(g, o);
   if (g->gc.state == GCSatomic) {
     top = tvref(th->stack) + th->stacksize;
+    // atomic阶段清除没有被使用的栈元素
     for (; o < top; o++)  /* Clear unmarked slots. */
       setnilV(o);
   }
+  // 标记线程用到的环境变量
   gc_markobj(g, tabref(th->env));
+
+  // TODO:
   lj_state_shrinkstack(th, gc_traverse_frames(g, th));
 }
 
@@ -307,32 +343,55 @@ static size_t propagatemark(global_State *g)
   GCobj *o = gcref(g->gc.gray);
   int gct = o->gch.gct;
   lua_assert(isgray(o));
+  // 将节点标记为黑色，并从灰色链表中移除
   gray2black(o);
   setgcrefr(g->gc.gray, o->gch.gclist);  /* Remove from gray list. */
+
   if (LJ_LIKELY(gct == ~LJ_TTAB)) {
+
+    // table
     GCtab *t = gco2tab(o);
+    // 遍历table中的元素，如果table是有弱引用设置的话，重新标记为灰色，将在atomic中重新遍历一次
     if (gc_traverse_tab(g, t) > 0)
       black2gray(o);  /* Keep weak tables gray. */
+    // 根据table元素数量，返回此次step的消耗值
     return sizeof(GCtab) + sizeof(TValue) * t->asize +
 			   (t->hmask ? sizeof(Node) * (t->hmask + 1) : 0);
+
   } else if (LJ_LIKELY(gct == ~LJ_TFUNC)) {
+
+    // fucntion
     GCfunc *fn = gco2func(o);
+
+    // 遍历函数内部的引用的gc对象
     gc_traverse_func(g, fn);
+
+    // 根据是lua函数还是c函数，返回根据upvalue个数相关的消耗值
     return isluafunc(fn) ? sizeLfunc((MSize)fn->l.nupvalues) :
 			   sizeCfunc((MSize)fn->c.nupvalues);
+
   } else if (LJ_LIKELY(gct == ~LJ_TPROTO)) {
+
+    // proto
     GCproto *pt = gco2pt(o);
+
+    // 遍历proto内部的引用的gc对象
     gc_traverse_proto(g, pt);
     return pt->sizept;
+
   } else if (LJ_LIKELY(gct == ~LJ_TTHREAD)) {
     lua_State *th = gco2th(o);
+    // 加入到grayagain，在atomic中在遍历一次用与清除未使用的栈变量
     setgcrefr(th->gclist, g->gc.grayagain);
     setgcref(g->gc.grayagain, o);
-    black2gray(o);  /* Threads are never black. */
+    black2gray(o);  // 标记为黑色
+
+    // 遍历thrad中引用的gc对象
     gc_traverse_thread(g, th);
     return sizeof(lua_State) + sizeof(TValue) * th->stacksize;
   } else {
 #if LJ_HASJIT
+    // TODO:
     GCtrace *T = gco2trace(o);
     gc_traverse_trace(g, T);
     return ((sizeof(GCtrace)+7)&~7) + (T->nins-T->nk)*sizeof(IRIns) +
@@ -607,15 +666,17 @@ static void atomic(global_State *g, lua_State *L)
 }
 
 /* GC state machine. Returns a cost estimate for each step performed. */
+// gc状态机函数，根据当前gc的状态进行相应的操作，并返回该操作的消耗
 static size_t gc_onestep(lua_State *L)
 {
   global_State *g = G(L);
   switch (g->gc.state) {
   case GCSpause:
+    // 当前处于暂停状态，说明开始新一轮的gc，进行一些gc的初始化操作
     gc_mark_start(g);  /* Start a new GC cycle by marking all GC roots. */
     return 0;
   case GCSpropagate:
-    if (gcref(g->gc.gray) != NULL)
+    if (gcref(g->gc.gray) != NULL)  // 如果当前还有灰色节点，则继续进行标记阶段
       return propagatemark(g);  /* Propagate one gray object. */
     g->gc.state = GCSatomic;  /* End of mark phase. */
     return 0;
