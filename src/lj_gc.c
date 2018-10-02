@@ -675,34 +675,49 @@ static size_t gc_onestep(lua_State *L)
   }
 }
 
-/* Perform a limited amount of incremental GC steps. */
+// 执行一次可以设置的步长大小的增量gc操作，该函数会在g->gc.total >= g->gc.threshold触发，即当前lua虚拟机总内存大于等于设置的gc阈值
+// 控制步长大小的变量为g->gc.stepmul，可以通过lua_gc(lua_State *L, int what, int data)，what传LUA_GCSETSTEPMUL进行设置
 int LJ_FASTCALL lj_gc_step(lua_State *L)
 {
   global_State *g = G(L);
   MSize lim;
-  int32_t ostate = g->vmstate;
-  setvmstate(g, GC);
+  int32_t ostate = g->vmstate;      // 保存当前的虚拟机状态
+  setvmstate(g, GC);                // 设置当前虚拟机状态为GC状态
+
+  // 计算该次gc的步长大小，用到了可以配置的变量g->gc.stepmul，该值默认是200
+  // GCSTEPSIZE默认大小为1024
   lim = (GCSTEPSIZE/100) * g->gc.stepmul;
+
+  // 如果g->gc.stepmul被设置成为0，那lim讲被设置成一个很大的数，即，这次step会一直执行到gc完成才退出
   if (lim == 0)
     lim = LJ_MAX_MEM;
+  
+  // 累计当前欠了多少内存
   if (g->gc.total > g->gc.threshold)
     g->gc.debt += g->gc.total - g->gc.threshold;
   do {
+    // 执行一次step，并扣除该step的消耗
     lim -= (MSize)gc_onestep(L);
+    // GCSpause状态表示当前处于暂停状态，在整个gc过程完成时候会进入到该状态，所以这里判断整个gc是否完成
     if (g->gc.state == GCSpause) {
+      // 设置下次进行gc的阈值，该阈值可以被控制g->gc.pause，该值默认为200
+      // g->gc.estimate表示当前lua虚拟机实际使用的内存，所以在默认情况下，下次gc的阈值为当前实际使用的内存的两倍
       g->gc.threshold = (g->gc.estimate/100) * g->gc.pause;
-      g->vmstate = ostate;
-      return 1;  /* Finished a GC cycle. */
+      g->vmstate = ostate;    // 重新设置回旧的虚拟机状态
+      return 1;  // 返回1表示整个gc已经结束
     }
-  } while ((int32_t)lim > 0);
+  } while ((int32_t)lim > 0); // 循环一直到当前步长结束
+
+  // 如果当前欠的内存比默认步长小，说明内存当前超过的不多，则适当增加下阈值，延长下下次gc的时间
   if (g->gc.debt < GCSTEPSIZE) {
     g->gc.threshold = g->gc.total + GCSTEPSIZE;
-    g->vmstate = ostate;
+    g->vmstate = ostate;    // 重新设置回旧的虚拟机状态
     return -1;
   } else {
+    // 如果当前欠的内存比较多，则从当前所欠内存里减去当前step的消耗（这是一个预估值），并且设置下次会立即gc
     g->gc.debt -= GCSTEPSIZE;
-    g->gc.threshold = g->gc.total;
-    g->vmstate = ostate;
+    g->gc.threshold = g->gc.total;  // 阈值设置为g->gc.total，则下次判断是否需要gc的时候还是会判断为true，所以会继续gc
+    g->vmstate = ostate;    // 重新设置回旧的虚拟机状态
     return 0;
   }
 }
