@@ -27,9 +27,9 @@
 #include "lj_vm.h"
 
 #define GCSTEPSIZE	1024u
-#define GCSWEEPMAX	40
-#define GCSWEEPCOST	10
-#define GCFINALIZECOST	100
+#define GCSWEEPMAX	40        // 表示一次最大清除gc对象的个数
+#define GCSWEEPCOST	10        // 表示每次清除的消耗
+#define GCFINALIZECOST	100   // userdata每次的finalized消耗
 
 /* Macros to set GCobj colors and flags. */
 #define white2gray(x)		((x)->gch.marked &= (uint8_t)~LJ_GC_WHITES)
@@ -70,12 +70,13 @@ static void gc_mark(global_State *g, GCobj *o)
     // upvalue
     GCupval *uv = gco2uv(o);
     gc_marktv(g, uvval(uv));  // 如果upvalue对应的是gc对象的话标记该gc对象
-    if (uv->closed)        // TODO: upvalue什么时候被closed？为什么closed的upvalue不会变灰？，如果不是closed的upvalue标记成灰色了，为什么不加入到gray list中？
+    if (uv->closed)        // upvalue引用的局部变量在函数返回时被closed，因为这时候这些局部变量不会在变，所以可以直接转为黑色。没有被closed的upvalue，因为函数还没有返回可能会变，所以不被编辑为黑色，在atomic统一再做一次处理
       gray2black(o);  /* Closed upvalues are never gray. */
   } else if (gct != ~LJ_TSTR && gct != ~LJ_TCDATA) {
     lua_assert(gct == ~LJ_TFUNC || gct == ~LJ_TTAB ||
 	       gct == ~LJ_TTHREAD || gct == ~LJ_TPROTO);
     // 如果类型不是string和cdata，加入到gray链表中
+    // 这两种类型没有子元素，不需要往下遍历，同时只要不是白色，最后gc的时候也不会被清除，省略了gray2black步骤
     setgcrefr(o->gch.gclist, g->gc.gray);
     setgcref(g->gc.gray, o);
   }
@@ -107,11 +108,13 @@ static void gc_mark_start(global_State *g)
 }
 
 /* Mark open upvalues. */
+// 重新标记所有被标记过的upvalue对象
 static void gc_mark_uv(global_State *g)
 {
   GCupval *uv;
   for (uv = uvnext(&g->uvhead); uv != &g->uvhead; uv = uvnext(uv)) {
     lua_assert(uvprev(uvnext(uv)) == uv && uvnext(uvprev(uv)) == uv);
+    // 如果upvalue之前被标记过为灰色，则重新标记下upvalue对应的gc对象
     if (isgray(obj2gco(uv)))
       gc_marktv(g, uvval(uv));
   }
@@ -135,15 +138,16 @@ static void gc_mark_mmudata(global_State *g)
 size_t lj_gc_separateudata(global_State *g, int all)
 {
   size_t m = 0;
+  // gc链表mainthread前面是普通gc对象，后面挂载的全部都是userdata
   GCRef *p = &mainthread(g)->nextgc;
   GCobj *o;
   while ((o = gcref(*p)) != NULL) {
     if (!(iswhite(o) || all) || isfinalized(gco2ud(o))) {
-      p = &o->gch.nextgc;  /* Nothing to do. */
+      p = &o->gch.nextgc;  // 如果不是可清楚对象，或者已经在上一次gc标记为finalized，则不处理
     } else if (!lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc)) {
-      markfinalized(o);  /* Done, as there's no __gc metamethod. */
+      markfinalized(o);  /* Done, as there's no __gc metamethod. */ // 没有'__gc'方法，直接标记为finalized
       p = &o->gch.nextgc;
-    } else {  /* Otherwise move userdata to be finalized to mmudata list. */
+    } else {  /* Otherwise move userdata to be finalized to mmudata list. */  // 标记为finalized，并加入到mmudata链表中，在finalized阶段进行处理
       m += sizeudata(gco2ud(o));
       markfinalized(o);
       *p = o->gch.nextgc;
@@ -296,6 +300,7 @@ static void gc_traverse_proto(global_State *g, GCproto *pt)
   for (i = -(ptrdiff_t)pt->sizekgc; i < 0; i++)  /* Mark collectable consts. */
     gc_markobj(g, proto_kgc(pt, i));
 #if LJ_HASJIT
+  // TODO:
   if (pt->trace) gc_marktrace(g, pt->trace);
 #endif
 }
@@ -353,7 +358,7 @@ static size_t propagatemark(global_State *g)
     GCtab *t = gco2tab(o);
     // 遍历table中的元素，如果table是有弱引用设置的话，重新标记为灰色，将在atomic中重新遍历一次
     if (gc_traverse_tab(g, t) > 0)
-      black2gray(o);  /* Keep weak tables gray. */
+      black2gray(o);  // 弱表之所以不能为黑色，是为了不触发barrierback；为了弥补可能的强引用关系，弱表将在atomic阶段再遍历一次
     // 根据table元素数量，返回此次step的消耗值
     return sizeof(GCtab) + sizeof(TValue) * t->asize +
 			   (t->hmask ? sizeof(Node) * (t->hmask + 1) : 0);
@@ -381,10 +386,10 @@ static size_t propagatemark(global_State *g)
 
   } else if (LJ_LIKELY(gct == ~LJ_TTHREAD)) {
     lua_State *th = gco2th(o);
-    // 加入到grayagain，在atomic中在遍历一次用与清除未使用的栈变量
+    // 加入到grayagain，在atomic中在遍历一次用于清除未使用的栈变量
     setgcrefr(th->gclist, g->gc.grayagain);
     setgcref(g->gc.grayagain, o);
-    black2gray(o);  // 标记为黑色
+    black2gray(o);  // 标记为灰色，不触发barrier，因为修改会很频繁，在atomic重新标记一次
 
     // 遍历thrad中引用的gc对象
     gc_traverse_thread(g, th);
@@ -454,7 +459,7 @@ static const GCFreeFunc gc_freefunc[] = {
 static GCRef *gc_sweep(global_State *g, GCRef *p, uint32_t lim)
 {
   /* Mask with other white and LJ_GC_FIXED. Or LJ_GC_SFIXED on shutdown. */
-  int ow = otherwhite(g);
+  int ow = otherwhite(g);   // 可以通过currentwhite变量来控制需要删除的对象
   GCobj *o;
   while ((o = gcref(*p)) != NULL && lim-- > 0) {
     if (o->gch.gct == ~LJ_TTHREAD)  /* Need to sweep open upvalues, too. */
@@ -468,22 +473,28 @@ static GCRef *gc_sweep(global_State *g, GCRef *p, uint32_t lim)
       setgcrefr(*p, o->gch.nextgc);
       if (o == gcref(g->gc.root))
 	setgcrefr(g->gc.root, o->gch.nextgc);  /* Adjust list anchor. */
-      gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);
+      gc_freefunc[o->gch.gct - ~LJ_TSTR](g, o);   // 直接调用注册好的清除函数回调
     }
   }
   return p;
 }
 
 /* Check whether we can clear a key or a value slot from a table. */
+// 检查该元素是否可以被清除，第二个参数val表示是value还是key
 static int gc_mayclear(cTValue *o, int val)
 {
   if (tvisgcv(o)) {  /* Only collectable objects can be weak references. */
+    // 字符串的话将被作为强引用，why?
     if (tvisstr(o)) {  /* But strings cannot be used as weak references. */
       gc_mark_str(strV(o));  /* And need to be marked. */
       return 0;
     }
+    // 白色的肯定可以被删除
     if (iswhite(gcV(o)))
       return 1;  /* Object is about to be collected. */
+
+    // 如果是userdata，且是value，以及finalized状态的可以被删除
+    // userdata无法作为key?
     if (tvisudata(o) && val && isfinalized(udataV(o)))
       return 1;  /* Finalized userdata is dropped only from values. */
   }
@@ -491,6 +502,7 @@ static int gc_mayclear(cTValue *o, int val)
 }
 
 /* Clear collected entries from weak tables. */
+// 清除弱表中的元素，如果该元素要被删除的话
 static void gc_clearweak(GCobj *o)
 {
   while (o) {
@@ -498,6 +510,7 @@ static void gc_clearweak(GCobj *o)
     lua_assert((t->marked & LJ_GC_WEAK));
     if ((t->marked & LJ_GC_WEAKVAL)) {
       MSize i, asize = t->asize;
+      // 检查array里面的每个元素
       for (i = 0; i < asize; i++) {
 	/* Clear array slot when value is about to be collected. */
 	TValue *tv = arrayslot(t, i);
@@ -505,12 +518,14 @@ static void gc_clearweak(GCobj *o)
 	  setnilV(tv);
       }
     }
+    // 检查hash表每个元素
     if (t->hmask > 0) {
       Node *node = noderef(t->node);
       MSize i, hmask = t->hmask;
       for (i = 0; i <= hmask; i++) {
 	Node *n = &node[i];
 	/* Clear hash slot when key or value is about to be collected. */
+  // 如果可以被清除，设置值为nil
 	if (!tvisnil(&n->val) && (gc_mayclear(&n->key, 0) ||
 				  gc_mayclear(&n->val, 1)))
 	  setnilV(&n->val);
@@ -544,6 +559,7 @@ static void gc_call_finalizer(global_State *g, lua_State *L,
 }
 
 /* Finalize one userdata or cdata object from the mmudata list. */
+// 调用userdata的'__gc'方法
 static void gc_finalize(lua_State *L)
 {
   global_State *g = G(L);
@@ -551,7 +567,7 @@ static void gc_finalize(lua_State *L)
   cTValue *mo;
   lua_assert(gcref(g->jit_L) == NULL);  /* Must not be called on trace. */
   /* Unchain from list of userdata to be finalized. */
-  if (o == gcref(g->gc.mmudata))
+  if (o == gcref(g->gc.mmudata))    // 结束
     setgcrefnull(g->gc.mmudata);
   else
     setgcrefr(gcref(g->gc.mmudata)->gch.nextgc, o->gch.nextgc);
@@ -576,10 +592,12 @@ static void gc_finalize(lua_State *L)
   }
 #endif
   /* Add userdata back to the main userdata list and make it white. */
+  // 加回到gc链表，并标记为白色，因为调用'__gc'方法可能会使该userdata又活过来，例如加入到内存池中
   setgcrefr(o->gch.nextgc, mainthread(g)->nextgc);
   setgcref(mainthread(g)->nextgc, o);
   makewhite(g, o);
   /* Resolve the __gc metamethod. */
+  // 调用'__gc'方法，如果有的话
   mo = lj_meta_fastg(g, tabref(gco2ud(o)->metatable), MM_gc);
   if (mo)
     gc_call_finalizer(g, L, mo, o);
@@ -636,26 +654,30 @@ static void atomic(global_State *g, lua_State *L)
 {
   size_t udsize;
 
+  // 重新标记所有的upvalue，并进行遍历
   gc_mark_uv(g);  /* Need to remark open upvalues (the thread may be dead). */
   gc_propagate_gray(g);  /* Propagate any left-overs. */
 
+  // 弱表重新在遍历一次
   setgcrefr(g->gc.gray, g->gc.weak);  /* Empty the list of weak tables. */
   setgcrefnull(g->gc.weak);
   lua_assert(!iswhite(obj2gco(mainthread(g))));
-  gc_markobj(g, L);  /* Mark running thread. */
+  gc_markobj(g, L);  /* Mark running thread. */   // 标记主线程
   gc_traverse_curtrace(g);  /* Traverse current trace. */
-  gc_mark_gcroot(g);  /* Mark GC roots (again). */
+  gc_mark_gcroot(g);  /* Mark GC roots (again). */    // 全局对象在重新遍历一次，因为一些metatable的修改不会触发barrier
   gc_propagate_gray(g);  /* Propagate all of the above. */
 
+  // grayagain重新在遍历一次，grayagain链表存放所有barrierback的对象
   setgcrefr(g->gc.gray, g->gc.grayagain);  /* Empty the 2nd chance list. */
   setgcrefnull(g->gc.grayagain);
   gc_propagate_gray(g);  /* Propagate it. */
 
   udsize = lj_gc_separateudata(g, 0);  /* Separate userdata to be finalized. */
-  gc_mark_mmudata(g);  /* Mark them. */
+  gc_mark_mmudata(g);  /* Mark them. */ // 改变这些对象的颜色，确保不再sweep阶段被处理（会在finalized阶段被处理）
   udsize += gc_propagate_gray(g);  /* And propagate the marks. */
 
   /* All marking done, clear weak tables. */
+  // 清除所有weak表的元素
   gc_clearweak(gcref(g->gc.weak));
 
   /* Prepare for sweep phase. */
@@ -673,12 +695,12 @@ static size_t gc_onestep(lua_State *L)
   switch (g->gc.state) {
   case GCSpause:
     // 当前处于暂停状态，说明开始新一轮的gc，进行一些gc的初始化操作
-    gc_mark_start(g);  /* Start a new GC cycle by marking all GC roots. */
+    gc_mark_start(g);
     return 0;
   case GCSpropagate:
     if (gcref(g->gc.gray) != NULL)  // 如果当前还有灰色节点，则继续进行标记阶段
-      return propagatemark(g);  /* Propagate one gray object. */
-    g->gc.state = GCSatomic;  /* End of mark phase. */
+      return propagatemark(g);
+    g->gc.state = GCSatomic;  // 标记阶段结束，进入到原子阶段
     return 0;
   case GCSatomic:
     if (gcref(g->jit_L))  /* Don't run atomic phase on trace. */
@@ -687,9 +709,9 @@ static size_t gc_onestep(lua_State *L)
     g->gc.state = GCSsweepstring;  /* Start of sweep phase. */
     g->gc.sweepstr = 0;
     return 0;
-  case GCSsweepstring: {
+  case GCSsweepstring: {    // 清除字符串阶段
     MSize old = g->gc.total;
-    gc_fullsweep(g, &g->strhash[g->gc.sweepstr++]);  /* Sweep one chain. */
+    gc_fullsweep(g, &g->strhash[g->gc.sweepstr++]);  /* Sweep one chain. */ // 一次遍历一个字符串hash table的冲突链表
     if (g->gc.sweepstr > g->strmask)
       g->gc.state = GCSsweep;  /* All string hash chains sweeped. */
     lua_assert(old >= g->gc.total);
@@ -698,12 +720,12 @@ static size_t gc_onestep(lua_State *L)
     }
   case GCSsweep: {
     MSize old = g->gc.total;
-    setmref(g->gc.sweep, gc_sweep(g, mref(g->gc.sweep, GCRef), GCSWEEPMAX));
+    setmref(g->gc.sweep, gc_sweep(g, mref(g->gc.sweep, GCRef), GCSWEEPMAX));  // 遍历gc链表，遍历GCSWEEPMAX个gc对象
     lua_assert(old >= g->gc.total);
     g->gc.estimate -= old - g->gc.total;
     if (gcref(*mref(g->gc.sweep, GCRef)) == NULL) {
       gc_shrink(g, L);
-      if (gcref(g->gc.mmudata)) {  /* Need any finalizations? */
+      if (gcref(g->gc.mmudata)) {  /* Need any finalizations? */  // 检查是否需要进入finalized状态
 	g->gc.state = GCSfinalize;
 #if LJ_HASFFI
 	g->gc.nocdatafin = 1;
@@ -845,7 +867,7 @@ void lj_gc_barrierf(global_State *g, GCobj *o, GCobj *v)
 
 /* Specialized barrier for closed upvalue. Pass &uv->tv. */
 void LJ_FASTCALL lj_gc_barrieruv(global_State *g, TValue *tv)
-{
+{{
 #define TV2MARKED(x) \
   (*((uint8_t *)(x) - offsetof(GCupval, tv) + offsetof(GCupval, marked)))
   if (g->gc.state == GCSpropagate || g->gc.state == GCSatomic)

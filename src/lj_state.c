@@ -181,13 +181,13 @@ lua_State *lj_state_newstate(lua_Alloc f, void *ud)
 LUA_API lua_State *lua_newstate(lua_Alloc f, void *ud)
 #endif
 {
-  GG_State *GG = (GG_State *)f(ud, NULL, 0, sizeof(GG_State));
+  GG_State *GG = (GG_State *)f(ud, NULL, 0, sizeof(GG_State));    // GG_State用来一次性申请需要的内存;
   lua_State *L = &GG->L;
   global_State *g = &GG->g;
   if (GG == NULL || !checkptr32(GG)) return NULL;
   memset(GG, 0, sizeof(GG_State));
   L->gct = ~LJ_TTHREAD;
-  L->marked = LJ_GC_WHITE0 | LJ_GC_FIXED | LJ_GC_SFIXED;  /* Prevent free. */
+  L->marked = LJ_GC_WHITE0 | LJ_GC_FIXED | LJ_GC_SFIXED;  // LJ_GC_FIXED和LJ_GC_SFIXED都是用来阻止被删除，LJ_GC_SFIXED在close的时候阻止被删除
   L->dummy_ffid = FF_C;
   setmref(L->glref, g);
   g->gc.currentwhite = LJ_GC_WHITE0 | LJ_GC_FIXED;
